@@ -1402,15 +1402,21 @@ async fn completions_single(
         let error_signal = StreamErrorSignal::default();
         let producer_error_signal = error_signal.clone();
         let stream = stream
-            .filter(|r| {
-                // Drop empty chunks from multi-byte token assembly
-                futures::future::ready(
-                    !r.data
-                        .as_ref()
-                        .is_some_and(is_empty_completion_stream_response),
-                )
-            })
             .map(move |response| {
+                // Drop empty chunks from multi-byte token assembly, but observe
+                // their metrics first: the engine generated these tokens.
+                if response
+                    .data
+                    .as_ref()
+                    .is_some_and(is_empty_completion_stream_response)
+                {
+                    process_response_and_observe_metrics(
+                        &response,
+                        &mut response_collector,
+                        &mut http_queue_guard,
+                    );
+                    return Ok(None);
+                }
                 let semantic_error = set_stream_semantic_error(&response, &producer_error_signal);
                 // Calls observe_response() on each token
                 let result = process_response_using_event_converter_and_observe_metrics(
@@ -1759,15 +1765,21 @@ async fn completions_batch(
         let error_signal = StreamErrorSignal::default();
         let producer_error_signal = error_signal.clone();
         let stream = merged_stream
-            .filter(|r| {
-                // Drop empty chunks from multi-byte token assembly
-                futures::future::ready(
-                    !r.data
-                        .as_ref()
-                        .is_some_and(is_empty_completion_stream_response),
-                )
-            })
             .map(move |response| {
+                // Drop empty chunks from multi-byte token assembly, but observe
+                // their metrics first: the engine generated these tokens.
+                if response
+                    .data
+                    .as_ref()
+                    .is_some_and(is_empty_completion_stream_response)
+                {
+                    process_response_and_observe_metrics(
+                        &response,
+                        &mut response_collector,
+                        &mut http_queue_guard,
+                    );
+                    return Ok(None);
+                }
                 let semantic_error = set_stream_semantic_error(&response, &producer_error_signal);
                 // Calls observe_response() on each token
                 let result = process_response_using_event_converter_and_observe_metrics(
