@@ -20,6 +20,9 @@
 //!   (parent map ref + our local upgrade). The strong-count gate is what
 //!   prevents reclaiming a node that a concurrent `find_matches` is currently
 //!   traversing — such edges are skipped and retried on the next sweep.
+//!
+//! Writers that empty a node can call [`unlink_if_stale`] directly, with the
+//! same checks, instead of leaving the node for the next sweep.
 
 use std::collections::VecDeque;
 use std::hash::Hash;
@@ -142,27 +145,37 @@ pub fn sweep_stale_children<N: CleanableNode>(root: &Arc<RwLock<N>>) {
         let (Some(parent), Some(child)) = (edge.parent.upgrade(), edge.child.upgrade()) else {
             continue;
         };
-
-        let mut parent_guard = parent.write();
-        let still_attached = parent_guard
-            .children()
-            .get(&edge.key)
-            .is_some_and(|current| Arc::ptr_eq(current, &child));
-        if !still_attached {
-            continue;
-        }
-
-        let Some(child_guard) = child.try_write() else {
-            continue;
-        };
-        if child_guard.has_any_workers() || !child_guard.children().is_empty() {
-            continue;
-        }
-        if Arc::strong_count(&child) != 2 {
-            continue;
-        }
-
-        parent_guard.remove_child(&edge.key);
-        drop(child_guard);
+        unlink_if_stale(&parent, edge.key, &child);
     }
+}
+
+/// Unlink `child` from `parent` if it is still attached under `key`, has no
+/// workers and no children, and nothing but the parent map and the caller
+/// references it.
+pub fn unlink_if_stale<N: CleanableNode>(
+    parent: &Arc<RwLock<N>>,
+    key: N::ChildKey,
+    child: &Arc<RwLock<N>>,
+) {
+    let mut parent_guard = parent.write();
+    let still_attached = parent_guard
+        .children()
+        .get(&key)
+        .is_some_and(|current| Arc::ptr_eq(current, child));
+    if !still_attached {
+        return;
+    }
+
+    let Some(child_guard) = child.try_write() else {
+        return;
+    };
+    if child_guard.has_any_workers() || !child_guard.children().is_empty() {
+        return;
+    }
+    if Arc::strong_count(child) != 2 {
+        return;
+    }
+
+    parent_guard.remove_child(&key);
+    drop(child_guard);
 }

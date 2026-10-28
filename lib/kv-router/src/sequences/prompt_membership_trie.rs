@@ -344,6 +344,8 @@ impl PromptMembershipTrie {
             "prompt removal must remove a non-empty suffix"
         );
 
+        // `None` is the root, which keeps removals off its shared refcount.
+        let mut parent: Option<SharedNode> = None;
         let mut current = {
             let root = self.root.read();
             let Some(node) = root.children.get(&path[0]).cloned() else {
@@ -373,13 +375,23 @@ impl PromptMembershipTrie {
                     return;
                 };
                 drop(node);
-                current = next;
+                parent = Some(std::mem::replace(&mut current, next));
                 continue;
             }
 
             let local_remove_from = remove_from.saturating_sub(path_pos);
             debug_assert!(local_remove_from < match_len);
             node.truncate_worker_at(worker, local_remove_from);
+
+            if !node.has_any_workers() {
+                // Losing the last holder also dropped the children. Unlink now so
+                // unique suffixes under a live prefix do not pile up until the
+                // timed sweep, which remains the backstop for referenced nodes.
+                drop(node);
+                let parent = parent.as_ref().unwrap_or(&self.root);
+                cleanup::unlink_if_stale(parent, path[path_pos], &current);
+                return;
+            }
 
             if match_len == remaining.len() {
                 return;
@@ -390,7 +402,7 @@ impl PromptMembershipTrie {
                 return;
             };
             drop(node);
-            current = next;
+            parent = Some(std::mem::replace(&mut current, next));
         }
     }
 
@@ -918,6 +930,107 @@ mod tests {
             assert_eq!(
                 trie.compute_overlap_depths(Some(&[1, 2, 3])),
                 FxHashMap::from_iter([(worker_a, 3), (worker_b, 3)])
+            );
+        }
+    }
+
+    fn child_keys(node: &SharedNode) -> Vec<SequenceHash> {
+        let mut keys: Vec<_> = node.read().children.keys().copied().collect();
+        keys.sort_unstable();
+        keys
+    }
+
+    #[test]
+    fn remove_path_unlinks_the_node_that_loses_its_last_holder() {
+        let trie = PromptMembershipTrie::default();
+        let worker_a = worker(1, 0);
+        let worker_b = worker(2, 0);
+        trie.store_path(worker_a, &[1, 2, 3], 0);
+        trie.store_path(worker_a, &[1, 2, 4], 2);
+        trie.store_path(worker_b, &[1, 2, 5], 0);
+        let prefix = trie.root.read().children.get(&1).cloned().expect("prefix");
+        assert_eq!(child_keys(&prefix), [3, 4, 5]);
+
+        // Worker A still holds the prefix through its other request.
+        trie.remove_path(worker_a, &[1, 2, 4], 2);
+        assert_eq!(child_keys(&prefix), [3, 5]);
+
+        // Worker B leaves the prefix as well as its suffix.
+        trie.remove_path(worker_b, &[1, 2, 5], 0);
+        assert_eq!(child_keys(&prefix), [3]);
+        drop(prefix);
+
+        trie.remove_path(worker_a, &[1, 2, 3], 0);
+        assert!(trie.root.read().children.is_empty());
+    }
+
+    #[test]
+    fn remove_path_leaves_a_referenced_dead_node_for_the_sweep() {
+        let trie = PromptMembershipTrie::default();
+        let worker = worker(1, 0);
+        trie.store_path(worker, &[1, 2, 3], 0);
+        trie.store_path(worker, &[1, 2, 4], 2);
+        let prefix = trie.root.read().children.get(&1).cloned().expect("prefix");
+        let reader = prefix.read().children.get(&4).cloned().expect("suffix");
+
+        trie.remove_path(worker, &[1, 2, 4], 2);
+        assert_eq!(child_keys(&prefix), [3, 4]);
+
+        drop(reader);
+        cleanup::sweep_stale_children(&trie.root);
+        assert_eq!(child_keys(&prefix), [3]);
+    }
+
+    #[test]
+    fn store_after_unlink_recreates_the_suffix() {
+        let trie = PromptMembershipTrie::default();
+        let worker = worker(1, 0);
+        trie.store_path(worker, &[1, 2, 3], 0);
+        trie.store_path(worker, &[1, 2, 4], 2);
+        trie.remove_path(worker, &[1, 2, 4], 2);
+        trie.store_path(worker, &[1, 2, 4], 2);
+
+        assert_eq!(
+            trie.compute_overlap_depths(Some(&[1, 2, 4])),
+            FxHashMap::from_iter([(worker, 3)]),
+        );
+        let prefix = trie.root.read().children.get(&1).cloned().expect("prefix");
+        assert_eq!(child_keys(&prefix), [3, 4]);
+    }
+
+    #[test]
+    fn concurrent_unlink_and_store_of_the_same_suffix_keep_the_store() {
+        for _ in 0..128 {
+            let trie = Arc::new(PromptMembershipTrie::default());
+            let worker_a = worker(1, 0);
+            let worker_b = worker(2, 0);
+            trie.store_path(worker_a, &[1, 2, 3], 0);
+            trie.store_path(worker_a, &[1, 2, 4], 2);
+
+            let barrier = Arc::new(std::sync::Barrier::new(3));
+            let remover = {
+                let trie = Arc::clone(&trie);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    trie.remove_path(worker_a, &[1, 2, 4], 2);
+                })
+            };
+            let storer = {
+                let trie = Arc::clone(&trie);
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    trie.store_path(worker_b, &[1, 2, 4], 0);
+                })
+            };
+            barrier.wait();
+            remover.join().unwrap();
+            storer.join().unwrap();
+
+            assert_eq!(
+                trie.compute_overlap_depths(Some(&[1, 2, 4])),
+                FxHashMap::from_iter([(worker_a, 2), (worker_b, 3)])
             );
         }
     }
