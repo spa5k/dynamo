@@ -143,18 +143,19 @@ impl Drop for PromptMembershipTrie {
 }
 
 impl PromptMembershipTrie {
-    /// Run the stale-child sweep if the throttle interval has elapsed.
+    /// Run the stale-child sweep if it is due.
     ///
-    /// Safe to call from any write path; the sweep is a no-op until
+    /// Safe to call from any write path. The sweep is a no-op until
     /// [`CLEANUP_INTERVAL_MS`](crate::cleanup::CLEANUP_INTERVAL_MS) has passed
-    /// since the last completion, and only one sweep runs at a time.
+    /// since the last completion, or until enough nodes have died (see the
+    /// [`cleanup`] module docs). Only one sweep runs at a time.
     pub(super) fn maybe_cleanup(&self) {
         if !self.cleanup.try_schedule() {
             return;
         }
         let mut guard = CleanupGuard::new(&self.cleanup);
-        cleanup::sweep_stale_children(&self.root);
-        guard.mark_completed();
+        let kept = cleanup::sweep_stale_children(&self.root);
+        guard.mark_completed(kept);
     }
 
     fn split_node(node: &mut PromptTrieNode, pos: usize) {
@@ -379,7 +380,11 @@ impl PromptMembershipTrie {
 
             let local_remove_from = remove_from.saturating_sub(path_pos);
             debug_assert!(local_remove_from < match_len);
+            let had_workers = node.has_any_workers();
             node.truncate_worker_at(worker, local_remove_from);
+            if had_workers && !node.has_any_workers() {
+                self.cleanup.note_death();
+            }
 
             if match_len == remaining.len() {
                 return;
@@ -401,7 +406,11 @@ impl PromptMembershipTrie {
         };
         while let Some(node) = nodes.pop_front() {
             let mut guard = node.write();
+            let had_workers = guard.has_any_workers();
             guard.drop_worker(worker);
+            if had_workers && !guard.has_any_workers() {
+                self.cleanup.note_death();
+            }
             nodes.extend(guard.children.values().cloned());
         }
     }
@@ -920,6 +929,87 @@ mod tests {
                 FxHashMap::from_iter([(worker_a, 3), (worker_b, 3)])
             );
         }
+    }
+
+    /// Worker `w` stores and removes `[1, 2, suffix]` for each suffix, so each
+    /// removal kills one suffix node under the prefix `[1, 2]`.
+    fn kill_suffixes(
+        trie: &PromptMembershipTrie,
+        w: WorkerWithDpRank,
+        suffixes: std::ops::Range<u64>,
+    ) {
+        for suffix in suffixes {
+            trie.store_path(w, &[1, 2, suffix], 0);
+            trie.remove_path(w, &[1, 2, suffix], 0);
+            trie.maybe_cleanup();
+        }
+    }
+
+    fn prefix_node(trie: &PromptMembershipTrie) -> SharedNode {
+        trie.root.read().children.get(&1).cloned().expect("prefix")
+    }
+
+    #[test]
+    fn dead_nodes_stay_for_revival_until_the_death_budget_starts_a_sweep() {
+        let trie = PromptMembershipTrie::default();
+        let (a, b) = (worker(1, 0), worker(2, 0));
+        trie.store_path(b, &[1, 2], 0);
+        let prefix = prefix_node(&trie);
+        let budget = cleanup::MIN_DEATHS_BEFORE_SWEEP as u64;
+
+        kill_suffixes(&trie, a, 100..100 + budget - 1);
+        assert_eq!(prefix.read().children.len(), budget as usize - 1);
+
+        let dead = prefix.read().children.get(&100).cloned().expect("dead");
+        trie.store_path(a, &[1, 2, 100], 0);
+        assert!(Arc::ptr_eq(&dead, &prefix.read().children[&100]));
+        drop(dead);
+
+        trie.remove_path(a, &[1, 2, 100], 0);
+        trie.maybe_cleanup();
+        assert!(prefix.read().children.is_empty());
+        assert_eq!(
+            trie.compute_overlap_depths(Some(&[1, 2, 3])),
+            FxHashMap::from_iter([(b, 2)])
+        );
+    }
+
+    #[test]
+    fn death_budget_grows_with_the_nodes_the_last_sweep_kept() {
+        let trie = PromptMembershipTrie::default();
+        let (a, b) = (worker(1, 0), worker(2, 0));
+        let live = cleanup::MIN_DEATHS_BEFORE_SWEEP as u64;
+        trie.store_path(b, &[1, 2], 0);
+        for suffix in 0..live {
+            trie.store_path(b, &[1, 2, suffix], 2);
+        }
+        let prefix = prefix_node(&trie);
+
+        // The first sweep keeps the prefix and its live suffixes.
+        kill_suffixes(&trie, a, live..2 * live);
+        assert_eq!(prefix.read().children.len(), live as usize);
+
+        let budget = (live + 1) * cleanup::DEATHS_PER_KEPT_NODE as u64;
+        kill_suffixes(&trie, a, 2 * live..2 * live + budget - 1);
+        assert_eq!(prefix.read().children.len(), (live + budget - 1) as usize);
+
+        kill_suffixes(&trie, a, 2 * live + budget..2 * live + budget + 1);
+        assert_eq!(prefix.read().children.len(), live as usize);
+    }
+
+    #[test]
+    fn remove_worker_deaths_count_toward_the_budget() {
+        let trie = PromptMembershipTrie::default();
+        let (a, b) = (worker(1, 0), worker(2, 0));
+        trie.store_path(b, &[1, 2], 0);
+        for suffix in 0..cleanup::MIN_DEATHS_BEFORE_SWEEP as u64 {
+            trie.store_path(a, &[1, 2, 100 + suffix], 0);
+        }
+        let prefix = prefix_node(&trie);
+
+        trie.remove_worker(a);
+        trie.maybe_cleanup();
+        assert!(prefix.read().children.is_empty());
     }
 
     #[test]
