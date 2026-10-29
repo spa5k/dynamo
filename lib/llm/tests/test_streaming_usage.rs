@@ -951,6 +951,43 @@ async fn test_cmpl_streaming_with_usage_true_no_backend_usage() {
     }
 }
 
+/// Completions chunks carry metrics in the typed field, as chat chunks do, so the
+/// HTTP observer does not parse JSON per chunk. A frame without data keeps the
+/// annotation.
+#[tokio::test]
+async fn test_cmpl_streaming_metrics_use_typed_field() {
+    let request = create_cmpl_request(Some(false), true);
+    let response_generator = Box::new(request.response_generator("cmpl-typed-1".to_string()));
+    let ctx = Arc::new(MockContext::new());
+    let backend_stream = create_mock_backend_stream(ctx.clone());
+
+    let chunks: Vec<_> = OpenAIPreprocessor::transform_postprocessor_stream(
+        backend_stream,
+        response_generator,
+        ctx.clone(),
+        false,
+        false,
+        None,
+        Default::default(),
+    )
+    .collect()
+    .await;
+
+    let (content, frames): (Vec<_>, Vec<_>) = chunks.iter().partition(|c| c.data.is_some());
+    assert_eq!(content.len(), 3, "three content chunks");
+    for (i, chunk) in content.iter().enumerate() {
+        let metrics = chunk.data.as_ref().unwrap().llm_metrics.as_ref();
+        assert_eq!(
+            metrics.map(|m| (m.output_tokens, m.chunk_tokens)),
+            Some((i + 1, 1)),
+            "content chunk {i} must carry typed metrics"
+        );
+        assert!(chunk.event.is_none() && chunk.comment.is_none());
+    }
+    assert_eq!(frames.len(), 1, "one terminal metrics frame");
+    assert_eq!(frames[0].event.as_deref(), Some("llm_metrics"));
+}
+
 #[tokio::test]
 async fn test_cmpl_streaming_with_cached_tokens_propagation() {
     // Completions: include_usage=true, backend provides cached_tokens -> must propagate

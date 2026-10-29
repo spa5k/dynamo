@@ -36,6 +36,7 @@ use crate::model_card::ModelDeploymentCard;
 use crate::protocols::{
     common::metrics::{ANNOTATION_LLM_METRICS, LLMMetricAnnotation},
     openai::chat_completions::NvCreateChatCompletionStreamResponse,
+    openai::completions::NvCreateCompletionResponse,
 };
 use crate::reasoning_field::{ReasoningField, RoutedReasoning};
 use dynamo_runtime::metrics::prometheus_names::clamp_u64_to_i64;
@@ -2760,6 +2761,57 @@ pub fn process_chat_response_and_observe_metrics(
     }
 }
 
+/// Process streaming metrics for completion responses.
+///
+/// The typed metrics field is the hot path. Annotation parsing remains as a compatibility
+/// fallback for legacy/generated annotation frames.
+pub fn process_completion_response_and_observe_metrics(
+    annotated: &crate::types::Annotated<NvCreateCompletionResponse>,
+    response_collector: &mut ResponseMetricCollector,
+    http_queue_guard: &mut Option<HttpQueueGuard>,
+) {
+    if let Some(metrics) = annotated
+        .data
+        .as_ref()
+        .and_then(|data| data.llm_metrics.as_ref())
+    {
+        observe_llm_metrics(metrics, response_collector, http_queue_guard);
+    } else {
+        process_response_and_observe_metrics(annotated, response_collector, http_queue_guard);
+    }
+}
+
+/// Process completion streaming responses with typed metrics before SSE conversion.
+///
+/// If the typed field is absent, this falls back to
+/// `process_response_using_event_converter_and_observe_metrics`.
+pub fn process_completion_response_using_event_converter_and_observe_metrics(
+    annotated: EventConverter<NvCreateCompletionResponse>,
+    response_collector: &mut ResponseMetricCollector,
+    http_queue_guard: &mut Option<HttpQueueGuard>,
+) -> Result<Option<Event>, axum::Error> {
+    if let Some(metrics) = annotated
+        .0
+        .data
+        .as_ref()
+        .and_then(|data| data.llm_metrics.as_ref())
+    {
+        observe_llm_metrics(metrics, response_collector, http_queue_guard);
+        let mut annotated = annotated.0;
+        if annotated.event.as_deref() == Some(crate::preprocessor::ANNOTATION_PAYLOAD_USAGE) {
+            annotated.event = None;
+            annotated.comment = None;
+            annotated.data = None;
+        }
+        return annotated_to_sse_event(annotated);
+    }
+    process_response_using_event_converter_and_observe_metrics(
+        annotated,
+        response_collector,
+        http_queue_guard,
+    )
+}
+
 /// Event converter wrapper for streaming responses
 pub struct EventConverter<T>(pub crate::types::Annotated<T>);
 
@@ -4785,6 +4837,205 @@ mod tests {
         let inbound: NvCreateChatCompletionStreamResponse =
             serde_json::from_value(inbound_json).unwrap();
         assert_eq!(inbound.llm_metrics, with_metrics.llm_metrics);
+    }
+
+    fn make_completion_annotated(
+        text: &str,
+    ) -> crate::types::Annotated<NvCreateCompletionResponse> {
+        use dynamo_protocols::types::{Choice, CreateCompletionResponse};
+
+        crate::types::Annotated::from_data(NvCreateCompletionResponse {
+            inner: CreateCompletionResponse {
+                id: "test-id".to_string(),
+                choices: vec![Choice {
+                    text: text.to_string(),
+                    index: 0,
+                    logprobs: None,
+                    finish_reason: None,
+                }],
+                created: 0,
+                model: "test-model".to_string(),
+                system_fingerprint: None,
+                object: "text_completion".to_string(),
+                usage: None,
+            },
+            nvext: None,
+            llm_metrics: None,
+        })
+    }
+
+    #[test]
+    fn test_completion_typed_metrics_fast_path_observes_without_annotation() {
+        use crate::protocols::common::metrics::LLMMetricAnnotation;
+
+        let metrics = Arc::new(Metrics::new());
+        let model = "test-model";
+        let mut collector = response_collector(&metrics, model);
+        let mut annotated = make_completion_annotated("hello");
+        annotated.data.as_mut().unwrap().llm_metrics = Some(LLMMetricAnnotation {
+            input_tokens: 10,
+            output_tokens: 20,
+            chunk_tokens: 5,
+            cached_tokens: Some(15),
+            ..Default::default()
+        });
+        assert!(annotated.event.is_none());
+        assert!(annotated.comment.is_none());
+
+        let mut http_queue_guard = Some(metrics.clone().create_http_queue_guard(model));
+        let event = process_completion_response_using_event_converter_and_observe_metrics(
+            EventConverter::from(annotated),
+            &mut collector,
+            &mut http_queue_guard,
+        )
+        .unwrap()
+        .expect("typed metrics data chunk should still produce an SSE event");
+        assert!(
+            http_queue_guard.is_none(),
+            "first positive chunk should release HTTP queue guard"
+        );
+        let json = extract_sse_data_json(event);
+        assert!(
+            json.get("llm_metrics").is_none(),
+            "typed metrics must be skipped on the SSE wire"
+        );
+        assert_eq!(json["choices"][0]["text"], "hello");
+
+        drop(collector);
+
+        let labels = &[model];
+        let ttft = metrics.time_to_first_token.with_label_values(labels);
+        assert_eq!(ttft.get_sample_count(), 1);
+        let isl = metrics.input_sequence_length.with_label_values(labels);
+        assert_eq!(isl.get_sample_sum(), 10.0);
+        let osl = metrics.output_sequence_length.with_label_values(labels);
+        assert_eq!(osl.get_sample_sum(), 20.0);
+        let cached = metrics.cached_tokens.with_label_values(labels);
+        assert_eq!(cached.get_sample_sum(), 15.0);
+        let output_tokens = metrics.output_tokens_counter.with_label_values(labels);
+        assert_eq!(output_tokens.get(), 5);
+    }
+
+    #[test]
+    fn test_completion_typed_metrics_non_streaming_observer() {
+        use crate::protocols::common::metrics::LLMMetricAnnotation;
+
+        let metrics = Arc::new(Metrics::new());
+        let model = "test-model";
+        let mut collector = response_collector(&metrics, model);
+        let mut annotated = make_completion_annotated("hello");
+        annotated.data.as_mut().unwrap().llm_metrics = Some(LLMMetricAnnotation {
+            input_tokens: 10,
+            output_tokens: 20,
+            chunk_tokens: 5,
+            ..Default::default()
+        });
+
+        process_completion_response_and_observe_metrics(&annotated, &mut collector, &mut None);
+        drop(collector);
+
+        let labels = &[model];
+        let ttft = metrics.time_to_first_token.with_label_values(labels);
+        assert_eq!(ttft.get_sample_count(), 1);
+        let osl = metrics.output_sequence_length.with_label_values(labels);
+        assert_eq!(osl.get_sample_sum(), 20.0);
+        let output_tokens = metrics.output_tokens_counter.with_label_values(labels);
+        assert_eq!(output_tokens.get(), 5);
+    }
+
+    #[test]
+    fn test_completion_typed_metrics_are_skipped_in_json() {
+        use crate::protocols::common::metrics::LLMMetricAnnotation;
+
+        let without_metrics = make_completion_annotated("hello").data.unwrap();
+        let mut with_metrics = without_metrics.clone();
+        with_metrics.llm_metrics = Some(LLMMetricAnnotation {
+            input_tokens: 1,
+            output_tokens: 2,
+            chunk_tokens: 1,
+            ..Default::default()
+        });
+
+        let without_json = serde_json::to_value(&without_metrics).unwrap();
+        let with_json = serde_json::to_value(&with_metrics).unwrap();
+        assert_eq!(with_json, without_json);
+        assert!(with_json.get("llm_metrics").is_none());
+    }
+
+    /// Frames from engines that bypass the preprocessor still carry metrics as
+    /// annotations. Both completion observers must keep parsing them.
+    #[test]
+    fn test_completion_legacy_annotation_metrics_fallback() {
+        use crate::protocols::common::metrics::LLMMetricAnnotation;
+
+        let metrics = Arc::new(Metrics::new());
+        let model = "test-model";
+        let mut collector = response_collector(&metrics, model);
+        let mut http_queue_guard = None;
+        let annotation = |output_tokens| {
+            LLMMetricAnnotation {
+                input_tokens: 10,
+                output_tokens,
+                chunk_tokens: 1,
+                ..Default::default()
+            }
+            .to_annotation::<()>()
+            .unwrap()
+        };
+
+        // Data chunk tagged with the legacy annotation: observed, then stripped.
+        let mut tagged = make_completion_annotated("hello");
+        let legacy = annotation(1);
+        tagged.event = legacy.event;
+        tagged.comment = legacy.comment;
+        let event = process_completion_response_using_event_converter_and_observe_metrics(
+            EventConverter::from(tagged),
+            &mut collector,
+            &mut http_queue_guard,
+        )
+        .unwrap()
+        .expect("data chunk should still produce an SSE event");
+        let sse = format!("{event:?}");
+        assert!(
+            !sse.contains(ANNOTATION_LLM_METRICS),
+            "legacy annotation must be stripped from the SSE event: {sse}"
+        );
+        assert_eq!(extract_sse_data_json(event)["choices"][0]["text"], "hello");
+
+        // Data-less legacy frame: observed and not forwarded.
+        let legacy = annotation(2);
+        let frame = crate::types::Annotated::<NvCreateCompletionResponse> {
+            id: None,
+            data: None,
+            event: legacy.event,
+            comment: legacy.comment,
+            error: None,
+        };
+        assert!(
+            process_completion_response_using_event_converter_and_observe_metrics(
+                EventConverter::from(frame.clone()),
+                &mut collector,
+                &mut http_queue_guard,
+            )
+            .unwrap()
+            .is_none()
+        );
+
+        // Non-streaming observer, same frame.
+        process_completion_response_and_observe_metrics(
+            &frame,
+            &mut collector,
+            &mut http_queue_guard,
+        );
+        drop(collector);
+
+        let labels = &[model];
+        let output_tokens = metrics.output_tokens_counter.with_label_values(labels);
+        assert_eq!(output_tokens.get(), 3);
+        let osl = metrics.output_sequence_length.with_label_values(labels);
+        assert_eq!(osl.get_sample_sum(), 2.0);
+        let ttft = metrics.time_to_first_token.with_label_values(labels);
+        assert_eq!(ttft.get_sample_count(), 1);
     }
 
     #[test]

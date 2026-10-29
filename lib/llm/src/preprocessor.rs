@@ -588,6 +588,14 @@ where
         return;
     }
 
+    if let Some(data) = response.data.as_mut()
+        && let Some(completion_response) =
+            (data as &mut dyn Any).downcast_mut::<NvCreateCompletionResponse>()
+    {
+        completion_response.llm_metrics = Some(metrics);
+        return;
+    }
+
     attach_metrics_annotation(response, &metrics);
 }
 

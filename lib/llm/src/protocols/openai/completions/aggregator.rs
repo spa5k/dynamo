@@ -152,6 +152,7 @@ impl DeltaAggregator {
         let response = NvCreateCompletionResponse {
             inner,
             nvext: aggregator.nvext,
+            llm_metrics: None,
         };
 
         Ok(response)
@@ -239,7 +240,11 @@ mod tests {
             object: "text_completion".to_string(),
         };
 
-        let response = NvCreateCompletionResponse { inner, nvext: None };
+        let response = NvCreateCompletionResponse {
+            inner,
+            nvext: None,
+            llm_metrics: None,
+        };
 
         Annotated {
             data: Some(response),
@@ -398,7 +403,11 @@ mod tests {
             object: "text_completion".to_string(),
         };
 
-        let response = NvCreateCompletionResponse { inner, nvext: None };
+        let response = NvCreateCompletionResponse {
+            inner,
+            nvext: None,
+            llm_metrics: None,
+        };
 
         let annotated_delta = Annotated {
             data: Some(response),

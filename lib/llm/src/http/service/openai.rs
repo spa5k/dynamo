@@ -50,6 +50,8 @@ use super::{
         CancellationLabels, Endpoint, ErrorType, EventConverter,
         process_chat_response_and_observe_metrics,
         process_chat_response_using_event_converter_and_observe_metrics,
+        process_completion_response_and_observe_metrics,
+        process_completion_response_using_event_converter_and_observe_metrics,
         process_response_and_observe_metrics,
         process_response_using_event_converter_and_observe_metrics,
     },
@@ -1410,7 +1412,7 @@ async fn completions_single(
                     .as_ref()
                     .is_some_and(is_empty_completion_stream_response)
                 {
-                    process_response_and_observe_metrics(
+                    process_completion_response_and_observe_metrics(
                         &response,
                         &mut response_collector,
                         &mut http_queue_guard,
@@ -1419,7 +1421,7 @@ async fn completions_single(
                 }
                 let semantic_error = set_stream_semantic_error(&response, &producer_error_signal);
                 // Calls observe_response() on each token
-                let result = process_response_using_event_converter_and_observe_metrics(
+                let result = process_completion_response_using_event_converter_and_observe_metrics(
                     EventConverter::from(response),
                     &mut response_collector,
                     &mut http_queue_guard,
@@ -1457,7 +1459,7 @@ async fn completions_single(
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = stream.inspect(move |response| {
             // Calls observe_response() on each token - drops http_queue_guard on first token
-            process_response_and_observe_metrics(
+            process_completion_response_and_observe_metrics(
                 response,
                 &mut response_collector,
                 &mut http_queue_guard,
@@ -1773,7 +1775,7 @@ async fn completions_batch(
                     .as_ref()
                     .is_some_and(is_empty_completion_stream_response)
                 {
-                    process_response_and_observe_metrics(
+                    process_completion_response_and_observe_metrics(
                         &response,
                         &mut response_collector,
                         &mut http_queue_guard,
@@ -1782,7 +1784,7 @@ async fn completions_batch(
                 }
                 let semantic_error = set_stream_semantic_error(&response, &producer_error_signal);
                 // Calls observe_response() on each token
-                let result = process_response_using_event_converter_and_observe_metrics(
+                let result = process_completion_response_using_event_converter_and_observe_metrics(
                     EventConverter::from(response),
                     &mut response_collector,
                     &mut http_queue_guard,
@@ -1817,7 +1819,7 @@ async fn completions_batch(
         let mut http_queue_guard = Some(http_queue_guard);
         let stream = merged_stream.inspect(move |response| {
             // Calls observe_response() on each token - drops http_queue_guard on first token
-            process_response_and_observe_metrics(
+            process_completion_response_and_observe_metrics(
                 response,
                 &mut response_collector,
                 &mut http_queue_guard,
@@ -11150,6 +11152,7 @@ mod tests {
                 usage,
             },
             nvext: None,
+            llm_metrics: None,
         }
     }
 
@@ -11206,6 +11209,7 @@ mod tests {
                 usage: Some(usage),
             },
             nvext: None,
+            llm_metrics: None,
         }
     }
 

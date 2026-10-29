@@ -115,6 +115,9 @@ fn success_contracts_distinguish_json_bodies_from_sse_events() {
     for internal in ["llm_metrics", "tool_call_completion", "prompt_logprobs"] {
         assert!(!stream.contains(internal), "internal field {internal}");
     }
+    let completion = &spec["components"]["schemas"]["NvCreateCompletionResponse"];
+    assert!(completion.is_object());
+    assert!(!completion.to_string().contains("llm_metrics"));
     assert!(
         spec["components"]["schemas"]["NvCreateChatCompletionResponse"]
             .to_string()

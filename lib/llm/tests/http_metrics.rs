@@ -288,23 +288,32 @@ impl
 
 /// Completions engine whose first chunk renders as nothing, as multi-byte token
 /// assembly produces, but still carries the metrics of the token it generated.
-/// The next chunk waits until the test opens `gate`.
+/// The next chunk waits until the test opens `gate`. With `typed`, metrics ride
+/// in the typed field, as the preprocessor attaches them; otherwise they ride
+/// in the legacy annotation.
 struct MockEmptyChunkCompletionsEngine {
     gate: Arc<tokio::sync::Semaphore>,
+    typed: bool,
 }
 
 fn with_completion_metrics(
-    response: NvCreateCompletionResponse,
+    mut response: NvCreateCompletionResponse,
     output_tokens: usize,
+    typed: bool,
 ) -> Annotated<NvCreateCompletionResponse> {
     let metrics = LLMMetricAnnotation {
         input_tokens: 5,
         output_tokens,
         chunk_tokens: 1,
         ..Default::default()
+    };
+    if typed {
+        response.llm_metrics = Some(metrics);
+        return Annotated::from_data(response);
     }
-    .to_annotation::<NvCreateCompletionResponse>()
-    .expect("metrics serialize");
+    let metrics = metrics
+        .to_annotation::<NvCreateCompletionResponse>()
+        .expect("metrics serialize");
     let mut annotated = Annotated::from_data(response);
     annotated.event = metrics.event;
     annotated.comment = metrics.comment;
@@ -327,11 +336,13 @@ impl
         let ctx = context.context();
         let generator = request.response_generator(ctx.id().to_string());
         let gate = Arc::clone(&self.gate);
+        let typed = self.typed;
 
         let stream = stream! {
             yield with_completion_metrics(
                 generator.create_choice(0, Some(String::new()), None, None),
                 1,
+                typed,
             );
 
             // The permit goes back on drop, so one permit releases every prompt.
@@ -345,6 +356,7 @@ impl
                     None,
                 ),
                 2,
+                typed,
             );
         };
 
@@ -1027,6 +1039,7 @@ async fn wait_for_metric_lines(
 async fn assert_streaming_completions_observe_empty_chunk_metrics(
     prompt: serde_json::Value,
     prompts: usize,
+    typed: bool,
 ) {
     temp_env::async_with_vars([(METRICS_PREFIX_ENV, None::<&str>)], async {
         let (listener, port) = bind_random_port().await;
@@ -1052,6 +1065,7 @@ async fn assert_streaming_completions_observe_empty_chunk_metrics(
                 card.mdcsum(),
                 Arc::new(MockEmptyChunkCompletionsEngine {
                     gate: Arc::clone(&gate),
+                    typed,
                 }),
             )
             .unwrap();
@@ -1111,6 +1125,10 @@ async fn assert_streaming_completions_observe_empty_chunk_metrics(
             vec!["gated"; prompts],
             "empty chunks must not reach the client; body:\n{body}"
         );
+        assert!(
+            !body.contains("llm_metrics"),
+            "metrics must not reach the client; body:\n{body}"
+        );
 
         let output_tokens_line = format!(
             "dynamo_frontend_output_tokens_total{{model=\"emptychunkmodel\"}} {}\n",
@@ -1133,14 +1151,37 @@ async fn assert_streaming_completions_observe_empty_chunk_metrics(
 /// Streaming `/v1/completions` with one prompt (`completions_single`).
 #[tokio::test]
 async fn test_streaming_completions_observes_empty_chunk_metrics() {
-    assert_streaming_completions_observe_empty_chunk_metrics(serde_json::json!("hi"), 1).await;
+    assert_streaming_completions_observe_empty_chunk_metrics(serde_json::json!("hi"), 1, false)
+        .await;
 }
 
 /// Streaming `/v1/completions` with a prompt batch (`completions_batch`).
 #[tokio::test]
 async fn test_streaming_completions_batch_observes_empty_chunk_metrics() {
-    assert_streaming_completions_observe_empty_chunk_metrics(serde_json::json!(["hi", "hi"]), 2)
+    assert_streaming_completions_observe_empty_chunk_metrics(
+        serde_json::json!(["hi", "hi"]),
+        2,
+        false,
+    )
+    .await;
+}
+
+/// Typed metrics, as the preprocessor attaches them, on `completions_single`.
+#[tokio::test]
+async fn test_streaming_completions_observes_typed_metrics() {
+    assert_streaming_completions_observe_empty_chunk_metrics(serde_json::json!("hi"), 1, true)
         .await;
+}
+
+/// Typed metrics, as the preprocessor attaches them, on `completions_batch`.
+#[tokio::test]
+async fn test_streaming_completions_batch_observes_typed_metrics() {
+    assert_streaming_completions_observe_empty_chunk_metrics(
+        serde_json::json!(["hi", "hi"]),
+        2,
+        true,
+    )
+    .await;
 }
 
 // Integration tests that require distributed runtime with etcd

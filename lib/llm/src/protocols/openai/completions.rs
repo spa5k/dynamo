@@ -71,6 +71,11 @@ pub struct NvCreateCompletionResponse {
     pub inner: dynamo_protocols::types::CreateCompletionResponse,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub nvext: Option<serde_json::Value>,
+    /// Internal frontend metrics payload. This must never be serialized to
+    /// client-facing OpenAI-compatible streams.
+    #[serde(default, skip_serializing)]
+    #[schema(ignore)]
+    pub llm_metrics: Option<crate::protocols::common::metrics::LLMMetricAnnotation>,
 }
 
 /// Schema-only import for the wholly re-exported async-openai response type.
@@ -376,7 +381,11 @@ impl ResponseFactory {
             system_fingerprint: self.system_fingerprint.clone(),
             usage,
         };
-        NvCreateCompletionResponse { inner, nvext: None }
+        NvCreateCompletionResponse {
+            inner,
+            nvext: None,
+            llm_metrics: None,
+        }
     }
 }
 

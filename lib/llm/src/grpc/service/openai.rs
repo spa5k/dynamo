@@ -24,7 +24,7 @@ use super::kserve::inference;
 // [gluo NOTE] These are common utilities that should be shared between frontends
 use crate::http::service::{
     disconnect::create_connection_monitor,
-    metrics::{CancellationLabels, Endpoint, process_response_and_observe_metrics},
+    metrics::{CancellationLabels, Endpoint, process_completion_response_and_observe_metrics},
 };
 use dynamo_protocols::types::{CompletionFinishReason, CreateCompletionRequest, Prompt};
 
@@ -162,7 +162,7 @@ pub async fn completion_response_stream(
     let mut http_queue_guard = Some(http_queue_guard);
     let stream = stream.inspect(move |response| {
         // Calls observe_response() on each token - drops http_queue_guard on first token
-        process_response_and_observe_metrics(
+        process_completion_response_and_observe_metrics(
             response,
             &mut response_collector,
             &mut http_queue_guard,
