@@ -4195,9 +4195,9 @@ mod tests {
         fn indexed_lora_projection_matches_nested_loop(
             groups in prop::collection::vec(
                 (
-                    // (endpoint, instance, base capacity, needs registration, DP size)
+                    // (endpoint, instance, base capacity, needs registration)
                     prop::collection::vec(
-                        (0..6usize, 1..5u64, prop::option::of(1..8u32), any::<bool>(), 1..3u32),
+                        (0..6usize, 1..5u64, prop::option::of(1..8u32), any::<bool>()),
                         0..6,
                     ),
                     // (endpoint, instance, LoRA name or no LoraInfo, adapter capacity)
@@ -4213,10 +4213,9 @@ mod tests {
             for (group_index, (members, adapters)) in groups.into_iter().enumerate() {
                 let cards = members
                     .into_iter()
-                    .map(|(endpoint, instance_id, capacity, needs_registration, dp_size)| {
+                    .map(|(endpoint, instance_id, capacity, needs_registration)| {
                         let mut card = ModelDeploymentCard::default();
                         card.runtime_config.max_gpu_lora_count = capacity;
-                        card.runtime_config.data_parallel_size = dp_size;
                         card.runtime_config.runtime_data.insert(
                             crate::lora::LORA_REQUIRES_REGISTRATION.into(),
                             needs_registration.into(),
