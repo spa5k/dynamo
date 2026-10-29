@@ -327,6 +327,22 @@ impl ModelManager {
         let mut pending: HashMap<EndpointId, HashMap<WorkerWithDpRank, PendingLoraProjection>> =
             HashMap::new();
         for group in self.discovery_groups.iter() {
+            // Parse each adapter key once per group, so a member card costs O(its adapters)
+            // rather than O(all adapters in the group).
+            let mut adapters_by_instance: HashMap<u64, Vec<(ModelCardInstanceId, &LoraInfo)>> =
+                HashMap::new();
+            for (adapter_key, adapter_card) in &group.adapters {
+                let (Ok(adapter_mcid), Some(lora)) = (
+                    ModelCardInstanceId::from_path(adapter_key),
+                    adapter_card.lora.as_ref(),
+                ) else {
+                    continue;
+                };
+                adapters_by_instance
+                    .entry(adapter_mcid.instance_id)
+                    .or_default()
+                    .push((adapter_mcid, lora));
+            }
             for (key, card) in &group.cards {
                 let Ok(mcid) = ModelCardInstanceId::from_path(key) else {
                     continue;
@@ -349,26 +365,30 @@ impl ModelManager {
                     .runtime_config
                     .runtime_flag_enabled(crate::lora::LORA_REQUIRES_REGISTRATION);
 
-                for (adapter_key, adapter_card) in &group.adapters {
-                    let Ok(adapter_mcid) = ModelCardInstanceId::from_path(adapter_key) else {
-                        continue;
-                    };
+                for (adapter_mcid, lora) in adapters_by_instance
+                    .get(&mcid.instance_id)
+                    .into_iter()
+                    .flatten()
+                {
                     if adapter_mcid.namespace != mcid.namespace
                         || adapter_mcid.component != mcid.component
                         || adapter_mcid.endpoint != mcid.endpoint
-                        || adapter_mcid.instance_id != mcid.instance_id
                     {
                         continue;
                     }
-                    if let Some(lora) = &adapter_card.lora {
-                        worker_projection
-                            .adapters
-                            .insert(lora.name.clone(), lora.clone());
-                    }
+                    worker_projection
+                        .adapters
+                        .insert(lora.name.clone(), (*lora).clone());
                 }
             }
         }
 
+        Self::finalize_lora_projection(pending)
+    }
+
+    fn finalize_lora_projection(
+        pending: HashMap<EndpointId, HashMap<WorkerWithDpRank, PendingLoraProjection>>,
+    ) -> EndpointLoraProjection {
         pending
             .into_iter()
             .map(|(endpoint_id, workers)| {
@@ -2904,7 +2924,9 @@ fn has_required_kv_transfer_policy(configs: &HashMap<WorkerId, ModelRuntimeConfi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{BTreeMap, HashMap};
+
+    use proptest::prelude::*;
 
     use dynamo_kv_router::protocols::{KV_EVENT_SUBJECT, WorkerWithDpRank};
     use dynamo_runtime::{
@@ -4082,6 +4104,158 @@ mod tests {
         assert!(manager.get_model_cards().is_empty());
         assert!(manager.get_committed_model("adapter").is_none());
         assert!(tracker.is_empty());
+    }
+
+    /// The nested loop that `lora_projection_locked` replaced, kept as its parity reference.
+    fn nested_loop_lora_projection(manager: &ModelManager) -> EndpointLoraProjection {
+        let mut pending: HashMap<EndpointId, HashMap<WorkerWithDpRank, PendingLoraProjection>> =
+            HashMap::new();
+        for group in manager.discovery_groups.iter() {
+            for (key, card) in &group.cards {
+                let Ok(mcid) = ModelCardInstanceId::from_path(key) else {
+                    continue;
+                };
+                let worker_projection = pending
+                    .entry(EndpointId {
+                        namespace: mcid.namespace.clone(),
+                        component: mcid.component.clone(),
+                        name: mcid.endpoint.clone(),
+                    })
+                    .or_default()
+                    .entry(WorkerWithDpRank::new(mcid.instance_id, 0))
+                    .or_default();
+                if let Some(capacity) = card.runtime_config.max_gpu_lora_count {
+                    worker_projection.base_capacities.push(capacity);
+                }
+                worker_projection.is_registration_required |= card
+                    .runtime_config
+                    .runtime_flag_enabled(crate::lora::LORA_REQUIRES_REGISTRATION);
+                for (adapter_key, adapter_card) in &group.adapters {
+                    let Ok(adapter_mcid) = ModelCardInstanceId::from_path(adapter_key) else {
+                        continue;
+                    };
+                    if adapter_mcid.namespace != mcid.namespace
+                        || adapter_mcid.component != mcid.component
+                        || adapter_mcid.endpoint != mcid.endpoint
+                        || adapter_mcid.instance_id != mcid.instance_id
+                    {
+                        continue;
+                    }
+                    if let Some(lora) = &adapter_card.lora {
+                        worker_projection
+                            .adapters
+                            .insert(lora.name.clone(), lora.clone());
+                    }
+                }
+            }
+        }
+        ModelManager::finalize_lora_projection(pending)
+    }
+
+    /// Indexes past the endpoint list produce malformed keys.
+    fn lora_parity_key(endpoint: usize, instance_id: u64, suffix: Option<String>) -> String {
+        const ENDPOINTS: [(&str, &str, &str); 4] = [
+            ("ns-a", "worker", "generate"),
+            ("ns-b", "worker", "generate"),
+            ("ns-a", "prefill", "generate"),
+            ("ns-a", "worker", "embed"),
+        ];
+        match ENDPOINTS.get(endpoint) {
+            Some(&(namespace, component, name)) => ModelCardInstanceId {
+                namespace: namespace.into(),
+                component: component.into(),
+                endpoint: name.into(),
+                instance_id,
+                model_suffix: suffix,
+            }
+            .to_path(),
+            None if endpoint == ENDPOINTS.len() => "ns-a/worker/generate/not-hex".into(),
+            None => format!("ns-a/worker/generate/{instance_id:x}/adapter/extra"),
+        }
+    }
+
+    fn comparable_lora_projection(
+        projection: EndpointLoraProjection,
+    ) -> BTreeMap<String, BTreeMap<WorkerWithDpRank, String>> {
+        projection
+            .into_iter()
+            .map(|(endpoint, workers)| {
+                let workers = workers
+                    .into_iter()
+                    .map(|(worker, projection)| (worker, format!("{projection:?}")))
+                    .collect();
+                (endpoint.to_string(), workers)
+            })
+            .collect()
+    }
+
+    proptest! {
+        /// Small id ranges make members and adapters collide across endpoints and instances.
+        #[test]
+        fn indexed_lora_projection_matches_nested_loop(
+            groups in prop::collection::vec(
+                (
+                    // (endpoint, instance, base capacity, needs registration, DP size)
+                    prop::collection::vec(
+                        (0..6usize, 1..5u64, prop::option::of(1..8u32), any::<bool>(), 1..3u32),
+                        0..6,
+                    ),
+                    // (endpoint, instance, LoRA name or no LoraInfo, adapter capacity)
+                    prop::collection::vec(
+                        (0..6usize, 1..5u64, prop::option::of(0..3u8), prop::option::of(1..8u32)),
+                        0..16,
+                    ),
+                ),
+                1..4,
+            )
+        ) {
+            let manager = ModelManager::new();
+            for (group_index, (members, adapters)) in groups.into_iter().enumerate() {
+                let cards = members
+                    .into_iter()
+                    .map(|(endpoint, instance_id, capacity, needs_registration, dp_size)| {
+                        let mut card = ModelDeploymentCard::default();
+                        card.runtime_config.max_gpu_lora_count = capacity;
+                        card.runtime_config.data_parallel_size = dp_size;
+                        card.runtime_config.runtime_data.insert(
+                            crate::lora::LORA_REQUIRES_REGISTRATION.into(),
+                            needs_registration.into(),
+                        );
+                        (lora_parity_key(endpoint, instance_id, None), card)
+                    })
+                    .collect();
+                let adapters = adapters
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, (endpoint, instance_id, name, capacity))| {
+                        let mut card = ModelDeploymentCard::default();
+                        card.lora = name.map(|name| LoraInfo {
+                            name: format!("lora-{name}"),
+                            max_gpu_lora_count: capacity,
+                        });
+                        let key = lora_parity_key(endpoint, instance_id, Some(format!("a{index}")));
+                        (key, card)
+                    })
+                    .collect();
+                manager.discovery_groups.insert(
+                    format!("group-{group_index}"),
+                    CommittedDiscoveryGroup {
+                        primary: "base".into(),
+                        namespace: "ns-a".into(),
+                        worker_set_key: format!("workers-{group_index}"),
+                        aliases: Vec::new(),
+                        cards,
+                        adapters,
+                        representative: ModelDeploymentCard::default(),
+                        worker_set: Arc::new(make_worker_set("ns-a", "lora")),
+                    },
+                );
+            }
+            prop_assert_eq!(
+                comparable_lora_projection(manager.lora_projection_locked()),
+                comparable_lora_projection(nested_loop_lora_projection(&manager))
+            );
+        }
     }
 
     #[test]
