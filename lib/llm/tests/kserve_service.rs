@@ -38,6 +38,7 @@ pub mod kserve_test {
     use async_stream::stream;
     use dynamo_llm::grpc::service::kserve::KserveService;
     use dynamo_llm::grpc::service::kserve::inference as kserve_inference;
+    use dynamo_llm::preprocessor::LLMMetricAnnotation;
     use dynamo_llm::protocols::{
         Annotated,
         openai::{
@@ -117,8 +118,15 @@ pub mod kserve_test {
             };
             let stream = stream! {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                for word in word_list {
-                    yield Annotated::from_data(generator.create_choice(0, Some(word.to_string()), None, None));
+                for (i, word) in word_list.into_iter().enumerate() {
+                    let mut response = generator.create_choice(0, Some(word), None, None);
+                    // Typed metrics, as the preprocessor attaches them.
+                    response.llm_metrics = Some(LLMMetricAnnotation {
+                        output_tokens: i + 1,
+                        chunk_tokens: 1,
+                        ..Default::default()
+                    });
+                    yield Annotated::from_data(response);
                 }
             };
 
@@ -2013,6 +2021,12 @@ pub mod kserve_test {
         );
         assert_metric_value(&metrics_body, "test_model", "completions", 1);
         assert_metric_value(&metrics_body, "test_tensor_model", "tensor", 1);
+        // SplitEngine sends one chunk with typed metrics for each prompt word.
+        // The gRPC handler observes each chunk before it replies.
+        assert!(
+            metrics_body.contains("dynamo_frontend_output_tokens_total{model=\"test_model\"} 2\n"),
+            "typed completions metrics must be observed; got:\n{metrics_body}"
+        );
 
         // Clean up
         cancel_token.cancel();

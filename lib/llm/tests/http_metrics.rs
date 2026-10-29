@@ -1030,17 +1030,19 @@ async fn wait_for_metric_lines(
     }
 }
 
-/// Streaming `/v1/completions` drops empty chunks from multi-byte token
-/// assembly. It must observe their metrics first, as the chat handler does,
-/// because the engine generated those tokens. Each prompt starts with an empty
-/// chunk and holds its next chunk behind a gate: TTFT must be exposed while the
-/// gate is closed, the output-token counter must count every chunk, and the
-/// client must still receive only the non-empty chunks.
-async fn assert_streaming_completions_observe_empty_chunk_metrics(
+/// `/v1/completions` must observe the metrics of every chunk, including the
+/// empty chunks from multi-byte token assembly, because the engine generated
+/// those tokens. Streaming drops empty chunks, so it must observe them first,
+/// as the chat handler does. Each prompt starts with an empty chunk and holds
+/// its next chunk behind a gate: TTFT must be exposed while the gate is closed,
+/// the output-token counter must count every chunk, and the client must still
+/// receive only the non-empty text.
+async fn assert_completions_observe_empty_chunk_metrics(
     prompt: serde_json::Value,
-    prompts: usize,
     typed: bool,
+    stream: bool,
 ) {
+    let prompts = prompt.as_array().map_or(1, Vec::len);
     temp_env::async_with_vars([(METRICS_PREFIX_ENV, None::<&str>)], async {
         let (listener, port) = bind_random_port().await;
         let service = HttpService::builder()
@@ -1082,7 +1084,7 @@ async fn assert_streaming_completions_observe_empty_chunk_metrics(
             let url = format!("http://localhost:{port}/v1/completions");
             let request = serde_json::json!({
                 "model": "emptychunkmodel",
-                "stream": true,
+                "stream": stream,
                 "max_tokens": 8,
                 "prompt": prompt,
             });
@@ -1106,24 +1108,24 @@ async fn assert_streaming_completions_observe_empty_chunk_metrics(
             .expect("completions request timed out")
             .unwrap()
             .unwrap();
-        let texts: Vec<String> = body
-            .lines()
-            .filter_map(|line| line.strip_prefix("data: "))
-            .filter(|data| *data != "[DONE]")
-            .flat_map(|data| {
-                let chunk: serde_json::Value = serde_json::from_str(data).unwrap();
-                chunk["choices"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .map(|choice| choice["text"].as_str().unwrap().to_string())
-                    .collect::<Vec<_>>()
-            })
+        let chunks: Vec<serde_json::Value> = if stream {
+            body.lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect()
+        } else {
+            vec![serde_json::from_str(&body).unwrap()]
+        };
+        let texts: Vec<&str> = chunks
+            .iter()
+            .flat_map(|chunk| chunk["choices"].as_array().into_iter().flatten())
+            .map(|choice| choice["text"].as_str().unwrap())
             .collect();
         assert_eq!(
             texts,
             vec!["gated"; prompts],
-            "empty chunks must not reach the client; body:\n{body}"
+            "the client must receive only the non-empty text; body:\n{body}"
         );
         assert!(
             !body.contains("llm_metrics"),
@@ -1151,37 +1153,39 @@ async fn assert_streaming_completions_observe_empty_chunk_metrics(
 /// Streaming `/v1/completions` with one prompt (`completions_single`).
 #[tokio::test]
 async fn test_streaming_completions_observes_empty_chunk_metrics() {
-    assert_streaming_completions_observe_empty_chunk_metrics(serde_json::json!("hi"), 1, false)
-        .await;
+    assert_completions_observe_empty_chunk_metrics(serde_json::json!("hi"), false, true).await;
 }
 
 /// Streaming `/v1/completions` with a prompt batch (`completions_batch`).
 #[tokio::test]
 async fn test_streaming_completions_batch_observes_empty_chunk_metrics() {
-    assert_streaming_completions_observe_empty_chunk_metrics(
-        serde_json::json!(["hi", "hi"]),
-        2,
-        false,
-    )
-    .await;
-}
-
-/// Typed metrics, as the preprocessor attaches them, on `completions_single`.
-#[tokio::test]
-async fn test_streaming_completions_observes_typed_metrics() {
-    assert_streaming_completions_observe_empty_chunk_metrics(serde_json::json!("hi"), 1, true)
+    assert_completions_observe_empty_chunk_metrics(serde_json::json!(["hi", "hi"]), false, true)
         .await;
 }
 
-/// Typed metrics, as the preprocessor attaches them, on `completions_batch`.
+/// Typed metrics, as the preprocessor attaches them, on each `/v1/completions`
+/// observer: streaming and non-streaming, `completions_single` and
+/// `completions_batch`.
+#[tokio::test]
+async fn test_streaming_completions_observes_typed_metrics() {
+    assert_completions_observe_empty_chunk_metrics(serde_json::json!("hi"), true, true).await;
+}
+
 #[tokio::test]
 async fn test_streaming_completions_batch_observes_typed_metrics() {
-    assert_streaming_completions_observe_empty_chunk_metrics(
-        serde_json::json!(["hi", "hi"]),
-        2,
-        true,
-    )
-    .await;
+    assert_completions_observe_empty_chunk_metrics(serde_json::json!(["hi", "hi"]), true, true)
+        .await;
+}
+
+#[tokio::test]
+async fn test_non_streaming_completions_observes_typed_metrics() {
+    assert_completions_observe_empty_chunk_metrics(serde_json::json!("hi"), true, false).await;
+}
+
+#[tokio::test]
+async fn test_non_streaming_completions_batch_observes_typed_metrics() {
+    assert_completions_observe_empty_chunk_metrics(serde_json::json!(["hi", "hi"]), true, false)
+        .await;
 }
 
 // Integration tests that require distributed runtime with etcd

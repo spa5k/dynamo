@@ -4916,52 +4916,6 @@ mod tests {
         assert_eq!(output_tokens.get(), 5);
     }
 
-    #[test]
-    fn test_completion_typed_metrics_non_streaming_observer() {
-        use crate::protocols::common::metrics::LLMMetricAnnotation;
-
-        let metrics = Arc::new(Metrics::new());
-        let model = "test-model";
-        let mut collector = response_collector(&metrics, model);
-        let mut annotated = make_completion_annotated("hello");
-        annotated.data.as_mut().unwrap().llm_metrics = Some(LLMMetricAnnotation {
-            input_tokens: 10,
-            output_tokens: 20,
-            chunk_tokens: 5,
-            ..Default::default()
-        });
-
-        process_completion_response_and_observe_metrics(&annotated, &mut collector, &mut None);
-        drop(collector);
-
-        let labels = &[model];
-        let ttft = metrics.time_to_first_token.with_label_values(labels);
-        assert_eq!(ttft.get_sample_count(), 1);
-        let osl = metrics.output_sequence_length.with_label_values(labels);
-        assert_eq!(osl.get_sample_sum(), 20.0);
-        let output_tokens = metrics.output_tokens_counter.with_label_values(labels);
-        assert_eq!(output_tokens.get(), 5);
-    }
-
-    #[test]
-    fn test_completion_typed_metrics_are_skipped_in_json() {
-        use crate::protocols::common::metrics::LLMMetricAnnotation;
-
-        let without_metrics = make_completion_annotated("hello").data.unwrap();
-        let mut with_metrics = without_metrics.clone();
-        with_metrics.llm_metrics = Some(LLMMetricAnnotation {
-            input_tokens: 1,
-            output_tokens: 2,
-            chunk_tokens: 1,
-            ..Default::default()
-        });
-
-        let without_json = serde_json::to_value(&without_metrics).unwrap();
-        let with_json = serde_json::to_value(&with_metrics).unwrap();
-        assert_eq!(with_json, without_json);
-        assert!(with_json.get("llm_metrics").is_none());
-    }
-
     /// Frames from engines that bypass the preprocessor still carry metrics as
     /// annotations. Both completion observers must keep parsing them.
     #[test]
